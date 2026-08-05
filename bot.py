@@ -5,6 +5,7 @@ from datetime import datetime
 from urllib.parse import urlparse
 
 import requests
+from playwright.async_api import async_playwright
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -17,6 +18,7 @@ from telegram.ext import (
 
 import config
 import database as db
+import devtools
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -41,7 +43,24 @@ KNOWN_SERVICES = {
     "linkvertise.com": "Linkvertise ad-shortener link",
     "adfly.com": "Adf.ly ad-shortener link",
     "ouo.io": "Ouo.io ad-shortener link",
+    "gplinks.in": "GPLinks ad-shortener link",
+    "gplinks.co": "GPLinks ad-shortener link",
+    "shrinkme.io": "Shrinkme ad-shortener link",
+    "exe.io": "Exe.io ad-shortener link",
+    "clk.sh": "Clk.sh ad-shortener link",
 }
+
+# Domains that use a JS/timer-based ad-wall — the simple HTTP method usually can't
+# get past these, so /check falls back to headless-browser automation for them.
+AD_WALL_KEYWORDS = [
+    "gplinks", "linkvertise", "shrinkme", "shrinke.me", "ouo.io",
+    "adfly", "shorte.st", "exe.io", "clk.sh", "droplink", "clicksfly",
+]
+
+
+def looks_like_ad_wall(url: str) -> bool:
+    domain = urlparse(url).netloc.lower()
+    return any(keyword in domain for keyword in AD_WALL_KEYWORDS)
 
 
 def identify_service(url: str) -> str:
@@ -50,6 +69,61 @@ def identify_service(url: str) -> str:
         if key in domain:
             return desc
     return f"Unrecognized service ({domain})" if domain else "Unknown"
+
+
+CONTINUE_BUTTON_TEXTS = [
+    "get link", "continue", "click here", "proceed", "verify",
+    "unlock link", "generate link", "get content", "skip ad",
+]
+
+# Limits how many headless browsers run at once, regardless of how many
+# /check requests come in simultaneously — prevents RAM exhaustion.
+BROWSER_SEMAPHORE = asyncio.Semaphore(config.MAX_CONCURRENT_BROWSERS)
+
+
+async def resolve_with_browser(url: str, max_clicks: int = 4, timer_wait_ms: int = 6000):
+    """Loads the page in a real headless browser, waits out any countdown timer,
+    and clicks through common 'continue/get link' buttons to reach the final URL.
+    Returns (chain, final_url, error). Cannot solve captchas/human-verification steps."""
+    chain = [url]
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"]
+        )
+        page = await browser.new_page(user_agent="Mozilla/5.0 LinkCheckerBot/1.0")
+        try:
+            await page.goto(url, timeout=20000, wait_until="domcontentloaded")
+
+            for _ in range(max_clicks):
+                await page.wait_for_timeout(timer_wait_ms)  # let any countdown finish
+
+                clicked = False
+                for text in CONTINUE_BUTTON_TEXTS:
+                    try:
+                        btn = page.get_by_text(text, exact=False)
+                        if await btn.count() > 0:
+                            try:
+                                async with page.expect_navigation(timeout=8000):
+                                    await btn.first.click()
+                            except Exception:
+                                await btn.first.click()
+                            clicked = True
+                            break
+                    except Exception:
+                        continue
+
+                if page.url not in chain:
+                    chain.append(page.url)
+                if not clicked:
+                    break
+
+            final_url = page.url
+        except Exception as e:
+            await browser.close()
+            return chain, None, f"Browser automation failed: {e}"
+
+        await browser.close()
+        return chain, final_url, None
 
 
 def resolve_link(url: str, max_hops: int = 10):
@@ -215,8 +289,27 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text(f"❌ <b>Failed!</b>\n{error}", parse_mode=ParseMode.HTML)
         return
 
+    used_browser = False
+    if looks_like_ad_wall(url) or looks_like_ad_wall(final_url):
+        if BROWSER_SEMAPHORE.locked():
+            await msg.edit_text(
+                "⏳ Ad-wall detected — other checks are running first, you're queued..."
+            )
+        async with BROWSER_SEMAPHORE:
+            await msg.edit_text(
+                "🤖 Ad-wall detected — using browser automation to get past the timer, "
+                "this can take 15-30s..."
+            )
+            browser_chain, browser_final, browser_error = await resolve_with_browser(final_url)
+        if browser_error is None and browser_final and browser_final != final_url:
+            chain += [u for u in browser_chain if u not in chain]
+            final_url = browser_final
+            used_browser = True
+        await msg.edit_text("🔍✨ Finishing up...")
+
     service = identify_service(final_url)
     hops_text = "\n".join(f"　{i + 1}️⃣ {u}" for i, u in enumerate(chain))
+    bypass_note = "🤖 <b>Bypassed via browser automation</b>\n" if used_browser else ""
 
     # File info from HTTP headers (content type + size, if it's a direct file link)
     content_type = headers.get("Content-Type", "Unknown").split(";")[0]
@@ -260,6 +353,7 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📥 <b>Original:</b>\n{url}\n\n"
         f"🎯 <b>Final destination:</b>\n{final_url}\n\n"
         f"🏷️ <b>Likely service:</b> {service}\n"
+        f"{bypass_note}"
         f"{file_text}"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"{safety_text}\n"
@@ -332,6 +426,25 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def tools_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        f"🧰 <b>D E V   T O O L S</b> 🧰\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🔗 <code>/check &lt;link&gt;</code> — resolve, bypass &amp; scan a link\n"
+        f"🧾 <code>/json &lt;text&gt;</code> — pretty-print JSON\n"
+        f"🔐 <code>/base64 encode|decode &lt;text&gt;</code>\n"
+        f"🔑 <code>/jwt &lt;token&gt;</code> — decode a JWT\n"
+        f"🔍 <code>/regex &lt;pattern&gt;|&lt;text&gt;</code> — test a regex\n"
+        f"🌐 <code>/apitest [METHOD] &lt;url&gt;</code> — hit an API\n"
+        f"📋 <code>/headers &lt;url&gt;</code> — response headers + timing\n"
+        f"🔒 <code>/ssl &lt;domain&gt;</code> — SSL certificate info\n"
+        f"🧭 <code>/dns &lt;domain&gt;</code> — DNS records\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"👨‍💻 <code>/dev</code> — developer contact"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
 async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
         return
@@ -354,6 +467,15 @@ def main():
     app.add_handler(CommandHandler("dev", dev))
     app.add_handler(CommandHandler("admin", admin))
     app.add_handler(CommandHandler("broadcast", broadcast))
+    app.add_handler(CommandHandler("tools", tools_list))
+    app.add_handler(CommandHandler("json", devtools.json_format))
+    app.add_handler(CommandHandler("base64", devtools.base64_cmd))
+    app.add_handler(CommandHandler("jwt", devtools.jwt_cmd))
+    app.add_handler(CommandHandler("regex", devtools.regex_cmd))
+    app.add_handler(CommandHandler("apitest", devtools.apitest_cmd))
+    app.add_handler(CommandHandler("headers", devtools.headers_cmd))
+    app.add_handler(CommandHandler("ssl", devtools.ssl_cmd))
+    app.add_handler(CommandHandler("dns", devtools.dns_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_private_message))
 
     logger.info("Bot starting...")

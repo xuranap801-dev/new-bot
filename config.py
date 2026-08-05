@@ -8,4 +8,9 @@ DEVELOPER_USERNAME = "@liesworlds"
 
 # Free API key from https://www.virustotal.com/gui/join-us (sign up -> profile -> API key)
 # Iske bina safety scan (malicious/safe check) kaam nahi karega
-VIRUSTOTAL_API_KEY = "b480178910a22ce23d921cd8ab163679cdf6832abab96eb25cd2271d7ae9b14e"
+VIRUSTOTAL_API_KEY = ""
+
+# Max number of headless-browser (Playwright) instances allowed to run at the same
+# time — protects low-RAM hosting (like Railway free tier) from crashing when many
+# ad-wall links are checked at once. Extra requests just wait their turn in a queue.
+MAX_CONCURRENT_BROWSERS = 1

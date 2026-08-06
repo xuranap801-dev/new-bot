@@ -37,6 +37,58 @@ def get_reply_or_arg_text(update: Update) -> str:
     return ""
 
 
+def fetch_ssl_info(domain: str) -> dict:
+    """Returns SSL cert info as a dict. Raises on failure — caller should catch."""
+    ctx = ssl.create_default_context()
+    with socket.create_connection((domain, 443), timeout=10) as sock:
+        with ctx.wrap_socket(sock, server_hostname=domain) as ssock:
+            cert = ssock.getpeercert()
+
+    issuer = dict(x[0] for x in cert.get("issuer", []))
+    subject = dict(x[0] for x in cert.get("subject", []))
+    not_after = cert.get("notAfter", "Unknown")
+
+    days_left = None
+    try:
+        expiry_dt = datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z")
+        days_left = (expiry_dt - datetime.utcnow()).days
+    except Exception:
+        pass
+
+    return {
+        "issuer": issuer.get("organizationName", issuer.get("commonName", "Unknown")),
+        "common_name": subject.get("commonName", "Unknown"),
+        "not_after": not_after,
+        "days_left": days_left,
+    }
+
+
+def fetch_dns_records(domain: str) -> dict:
+    """Returns {record_type: [values]}. Never raises — returns {} on total failure."""
+    records = {}
+    if DNS_AVAILABLE:
+        for record_type in ("A", "AAAA", "MX", "TXT", "NS", "CNAME"):
+            try:
+                answers = dns.resolver.resolve(domain, record_type, lifetime=8)
+                records[record_type] = [str(r) for r in answers]
+            except Exception:
+                continue
+    else:
+        try:
+            records["A"] = [socket.gethostbyname(domain)]
+        except Exception:
+            pass
+    return records
+
+
+def fetch_headers_info(url: str):
+    """Returns (response, elapsed_ms). Raises on failure — caller should catch."""
+    start = time.time()
+    resp = requests.get(url, timeout=15, allow_redirects=True)
+    elapsed_ms = (time.time() - start) * 1000
+    return resp, elapsed_ms
+
+
 # ---------------------------------------------------------------- /json ----
 async def json_format(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw = get_reply_or_arg_text(update)

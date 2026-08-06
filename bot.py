@@ -206,6 +206,22 @@ def format_file_size(size_str):
     return f"{size:.1f} TB"
 
 
+def extract_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gets the target URL from command args, or from a replied-to message."""
+    if context.args:
+        return context.args[0]
+    if update.message.reply_to_message:
+        replied_text = (
+            update.message.reply_to_message.text
+            or update.message.reply_to_message.caption
+            or ""
+        )
+        found = URL_REGEX.search(replied_text)
+        if found:
+            return found.group(0)
+    return None
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     is_new = db.add_user(user.id, user.username, user.first_name)
@@ -251,19 +267,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    url = None
-
-    if context.args:
-        url = context.args[0]
-    elif update.message.reply_to_message:
-        replied_text = (
-            update.message.reply_to_message.text
-            or update.message.reply_to_message.caption
-            or ""
-        )
-        found = URL_REGEX.search(replied_text)
-        if found:
-            url = found.group(0)
+    url = extract_url(update, context)
 
     if not url:
         await update.message.reply_text(
@@ -364,6 +368,134 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.edit_text(result, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
+async def checkall(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    url = extract_url(update, context)
+
+    if not url:
+        await update.message.reply_text(
+            "🤔 <b>Oops!</b>\nUsage: <code>/checkall &lt;link&gt;</code>\n"
+            "Or reply to a message containing a link with <code>/checkall</code> 🔗",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if not URL_REGEX.match(url):
+        await update.message.reply_text(
+            "🚫 That doesn't look like a valid link.\nIt must start with <code>http://</code> or <code>https://</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    msg = await update.message.reply_text("📡✨ <b>Fetching info...</b>", parse_mode=ParseMode.HTML)
+
+    chain, final_url, error, headers = resolve_link(url)
+    db.log_search(update.effective_user.id, url)
+    if error:
+        await msg.edit_text(f"❌ <b>Failed!</b>\n{error}", parse_mode=ParseMode.HTML)
+        return
+
+    used_browser = False
+    if looks_like_ad_wall(url) or looks_like_ad_wall(final_url):
+        if BROWSER_SEMAPHORE.locked():
+            await msg.edit_text(
+                "⏳✨ <b>Bypass queued...</b> other checks running first, hang tight",
+                parse_mode=ParseMode.HTML,
+            )
+        async with BROWSER_SEMAPHORE:
+            await msg.edit_text("🤖✨ <b>Bypassing ad-wall...</b>", parse_mode=ParseMode.HTML)
+            browser_chain, browser_final, browser_error = await resolve_with_browser(final_url)
+        if browser_error is None and browser_final and browser_final != final_url:
+            chain += [u for u in browser_chain if u not in chain]
+            final_url = browser_final
+            used_browser = True
+
+    service = identify_service(final_url)
+    domain = urlparse(final_url).netloc
+    content_type = headers.get("Content-Type", "Unknown").split(";")[0]
+    content_length = headers.get("Content-Length")
+
+    await msg.edit_text("🛡️✨ <b>Running safety scan...</b>", parse_mode=ParseMode.HTML)
+    vt_stats = vt_check_url(final_url)
+
+    await msg.edit_text("📋✨ <b>Checking headers &amp; response time...</b>", parse_mode=ParseMode.HTML)
+    try:
+        h_resp, elapsed_ms = devtools.fetch_headers_info(final_url)
+        redirect_count = len(h_resp.history)
+    except Exception:
+        elapsed_ms, redirect_count = None, max(len(chain) - 1, 0)
+
+    await msg.edit_text("🔒✨ <b>Checking SSL certificate...</b>", parse_mode=ParseMode.HTML)
+    ssl_info = None
+    try:
+        ssl_info = devtools.fetch_ssl_info(domain)
+    except Exception:
+        pass
+
+    await msg.edit_text("🧭✨ <b>Checking DNS records...</b>", parse_mode=ParseMode.HTML)
+    try:
+        dns_records = devtools.fetch_dns_records(domain)
+    except Exception:
+        dns_records = {}
+
+    # --- build display text ---
+    if vt_stats is None:
+        safety_text = "🛡️ <b>Safety:</b> unavailable (no VirusTotal key or scan failed)"
+    else:
+        malicious = vt_stats.get("malicious", 0)
+        suspicious = vt_stats.get("suspicious", 0)
+        harmless = vt_stats.get("harmless", 0)
+        undetected = vt_stats.get("undetected", 0)
+        if malicious > 0:
+            verdict = "🔴 <b>MALICIOUS</b>"
+        elif suspicious > 0:
+            verdict = "🟡 <b>SUSPICIOUS</b>"
+        else:
+            verdict = "🟢 <b>No detections</b>"
+        safety_text = (
+            f"🛡️ <b>Safety:</b> {verdict}\n"
+            f"　☠️ {malicious} | ⚠️ {suspicious} | ✅ {harmless} | ❔ {undetected}"
+        )
+
+    ssl_text = "Unavailable (non-HTTPS or connection failed)"
+    if ssl_info:
+        days_note = f" (🟢 {ssl_info['days_left']}d left)" if ssl_info["days_left"] is not None else ""
+        ssl_text = f"{devtools.esc(ssl_info['issuer'])}{days_note}"
+
+    if dns_records:
+        dns_lines = "\n".join(
+            f"　<b>{rt}:</b> {devtools.esc(', '.join(vals[:3]))}" for rt, vals in dns_records.items()
+        )
+    else:
+        dns_lines = "　No records found"
+
+    bypass_note = "🤖 <b>Bypassed via browser automation</b>\n" if used_browser else ""
+    response_time_text = f"{elapsed_ms:.0f} ms" if elapsed_ms is not None else "Unknown"
+    hops_text = "\n".join(f"　{i + 1}️⃣ {devtools.esc(u)}" for i, u in enumerate(chain))
+
+    result = (
+        f"🧨 <b>C H E C K A L L   R E P O R T</b> 🧨\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"📥 <b>Original:</b>\n{devtools.esc(url)}\n\n"
+        f"🎯 <b>Final destination:</b>\n{devtools.esc(final_url)}\n\n"
+        f"🏷️ <b>Service:</b> {devtools.esc(service)}\n"
+        f"{bypass_note}"
+        f"📄 <b>Content type:</b> {devtools.esc(content_type)}\n"
+        f"📦 <b>Size:</b> {format_file_size(content_length)}\n"
+        f"⏱️ <b>Response time:</b> {response_time_text}\n"
+        f"↪️ <b>Redirects:</b> {redirect_count}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"{safety_text}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🔒 <b>SSL:</b> {ssl_text}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🧭 <b>DNS records:</b>\n{dns_lines}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🛤️ <b>Redirect chain:</b>\n{hops_text}\n\n"
+        f"✅ <b>All checks complete!</b>"
+    )
+    await msg.edit_text(result, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+
 async def dev(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"👨‍💻 <b>Developer</b>\n"
@@ -431,6 +563,7 @@ async def tools_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🧰 <b>D E V   T O O L S</b> 🧰\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"🔗 <code>/check &lt;link&gt;</code> — resolve, bypass &amp; scan a link\n"
+        f"🧨 <code>/checkall &lt;link&gt;</code> — run every tool on a link at once\n"
         f"🧾 <code>/json &lt;text&gt;</code> — pretty-print JSON\n"
         f"🔐 <code>/base64 encode|decode &lt;text&gt;</code>\n"
         f"🔑 <code>/jwt &lt;token&gt;</code> — decode a JWT\n"
@@ -464,6 +597,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("check", check))
+    app.add_handler(CommandHandler("checkall", checkall))
     app.add_handler(CommandHandler("dev", dev))
     app.add_handler(CommandHandler("admin", admin))
     app.add_handler(CommandHandler("broadcast", broadcast))
